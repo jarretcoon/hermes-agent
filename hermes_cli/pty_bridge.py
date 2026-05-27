@@ -217,9 +217,12 @@ class PtyBridge:
             if not self._proc.isalive():
                 break
             try:
-                self._proc.kill(sig)
+                os.killpg(os.getpgid(self._proc.pid), sig)
             except Exception:
-                pass
+                try:
+                    self._proc.kill(sig)
+                except Exception:
+                    pass
             deadline = time.monotonic() + 0.5
             while self._proc.isalive() and time.monotonic() < deadline:
                 time.sleep(0.02)

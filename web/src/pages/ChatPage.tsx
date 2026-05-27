@@ -553,9 +553,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // (React StrictMode remount, route change) so we never write to a
     // disposed xterm or setState on an unmounted tree.
     let unmounting = false;
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
     ws.onopen = () => {
       setBanner(null);
+      heartbeatTimer = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send("\x1b[HEARTBEAT]");
+      }, 5000);
       // Send the initial RESIZE immediately so Ink has *a* size to lay
       // out against on its first paint.  The double-rAF block above will
       // follow up with the authoritative measurement — at worst Ink
@@ -640,6 +644,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       if (hostSyncRaf) cancelAnimationFrame(hostSyncRaf);
       if (settleRaf1) cancelAnimationFrame(settleRaf1);
       if (settleRaf2) cancelAnimationFrame(settleRaf2);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
       ws.close();
       wsRef.current = null;
       term.dispose();

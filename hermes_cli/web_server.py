@@ -3320,6 +3320,7 @@ except ImportError as _pty_import_err:  # pragma: no cover - Windows-only path
         pass
 
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
+_HEARTBEAT_FRAME = b"\x1b[HEARTBEAT]"
 _PTY_READ_CHUNK_TIMEOUT = 0.2
 _VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 # Starlette's TestClient reports the peer as "testclient"; treat it as
@@ -3516,15 +3517,25 @@ async def pty_ws(ws: WebSocket) -> None:
 
     loop = asyncio.get_running_loop()
 
+    last_client_frame = loop.time()
+
     # --- reader task: PTY master → WebSocket ----------------------------
     async def pump_pty_to_ws() -> None:
+        next_keepalive = loop.time() + 5.0
         while True:
             chunk = await loop.run_in_executor(
                 None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
             )
             if chunk is None:  # EOF
                 return
-            if not chunk:  # no data this tick; yield control and retry
+            if not chunk:
+                now = loop.time()
+                if now >= next_keepalive:
+                    try:
+                        await ws.send_bytes(b"")
+                    except Exception:
+                        return
+                    next_keepalive = now + 5.0
                 await asyncio.sleep(0)
                 continue
             try:
@@ -3534,10 +3545,37 @@ async def pty_ws(ws: WebSocket) -> None:
 
     reader_task = asyncio.create_task(pump_pty_to_ws())
 
+    async def close_ws_when_reader_stops() -> None:
+        try:
+            await reader_task
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    reader_watch_task = asyncio.create_task(close_ws_when_reader_stops())
+
+    async def heartbeat_watchdog() -> None:
+        while True:
+            await asyncio.sleep(5.0)
+            if loop.time() - last_client_frame > 15.0:
+                bridge.close()
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                return
+
+    heartbeat_watchdog_task = asyncio.create_task(heartbeat_watchdog())
+
     # --- writer loop: WebSocket → PTY master ----------------------------
     try:
         while True:
-            msg = await ws.receive()
+            try:
+                msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
+            except asyncio.TimeoutError:
+                break
             msg_type = msg.get("type")
             if msg_type == "websocket.disconnect":
                 break
@@ -3545,7 +3583,10 @@ async def pty_ws(ws: WebSocket) -> None:
             if raw is None:
                 text = msg.get("text")
                 raw = text.encode("utf-8") if isinstance(text, str) else b""
+            last_client_frame = loop.time()
             if not raw:
+                continue
+            if raw == _HEARTBEAT_FRAME:
                 continue
 
             # Resize escape is consumed locally, never written to the PTY.
